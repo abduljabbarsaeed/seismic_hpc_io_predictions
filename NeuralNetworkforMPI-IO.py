@@ -1,14 +1,14 @@
-import yaml
 import torch
 import torch.nn as nn
 import pandas as pd
 import matplotlib
 matplotlib.use('agg')
 import matplotlib.pyplot as plt
-from sklearn.ensemble import RandomForestRegressor
 import numpy as np
 import sys
-import itertools
+import os
+
+os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
 
 np.random.seed(0)
 torch.manual_seed(3)    # reproducible
@@ -25,9 +25,11 @@ data_file_path = sys.argv[3]
 H1 = sys.argv[4]
 H2 = sys.argv[5]
 
-#################### LOADING MPI_IO READ DATA #####################
+#################### LOADING DATA #####################
 
 mpio_read_data = pd.read_csv(data_file_path)
+
+#################### SCALING OR NORMALIZTION ######################
 
 f = open(benchmark_name+operation+"_maxs.txt","w+")
 
@@ -55,6 +57,8 @@ read_max_stripe_count = mpio_read_data["lustre_stripe_count"].max()
 f.write(str(mpio_read_data["lustre_stripe_count"].max())+"\n")
 mpio_read_data["lustre_stripe_count"] = mpio_read_data["lustre_stripe_count"] / \
                               mpio_read_data["lustre_stripe_count"].max()
+
+##################### NORMALIZING MPI-IO SPECIFIC PARAMETERS ################################
 
 if benchmark_name == "MPI-IO":
     mpio_read_data = mpio_read_data.drop(['uid','from_uid', \
@@ -84,6 +88,8 @@ if benchmark_name == "MPI-IO":
     mpio_read_data["file_size"] = mpio_read_data["file_size"] / \
                                   mpio_read_data["file_size"].max()
 
+############################# NORMALIZING SEG-Y IO SPECIFIC PARAMETERS ################
+
 if benchmark_name == "SEG-Y-IO":
     mpio_read_data = mpio_read_data.drop(['uid','from_uid', \
                                       'benchmark','file_name_1', \
@@ -111,6 +117,8 @@ if benchmark_name == "SEG-Y-IO":
     f.write(str(read_max_samples)+"\n")
     mpio_read_data["samples_per_trace"] = mpio_read_data["samples_per_trace"] / \
                                   mpio_read_data["samples_per_trace"].max() 
+
+########################### NORMALIZING SEG-Y SORTING SPECIFIC PARAMETERS ##################
 
 if benchmark_name == "SEG-Y-SORT":
     mpio_read_data = mpio_read_data.drop(['uid','from_uid', \
@@ -142,7 +150,8 @@ if benchmark_name == "SEG-Y-SORT":
 
 f.close()
 
-#all_read_configs = torch.Tensor(mpio_read_data.drop(['io_bandwidth'],axis=1).values)
+################# DATA SAMPLING OR SHUFFLING #########################
+
 mpio_read_data = mpio_read_data.sample(frac=1)
 pd.set_option('display.max_columns', 8)
 torch.set_printoptions(profile="full")
@@ -151,9 +160,11 @@ read_bandwidth_values = torch.Tensor(mpio_read_data["io_bandwidth"])
 read_configs = torch.Tensor(mpio_read_data.drop(['io_bandwidth'],axis=1).values)
 print(mpio_read_data.iloc[0:2,:])
 print(read_configs[0:2,:])
-#input()
-total_rows = int((80.0 / 100.0) * read_configs.size()[0])
-final_rows = int((20.0 / 100.0) * read_configs.size()[0])
+
+################# DATA SPLITTING ################################
+
+total_rows = int((80.0 / 100.0) * read_configs.size()[0]) # total rows are training rows
+final_rows = int((20.0 / 100.0) * read_configs.size()[0]) # final rows are testing rows
 total_cols = read_configs.size()[1]
 
 test_csv = mpio_read_data.iloc[total_rows:total_rows+final_rows,:]
@@ -161,7 +172,7 @@ test_csv.to_csv(benchmark_name+"-"+operation+"-"+H1+"-"+H2+"-test-data.csv")
 
 #quit()
 
-########################### TRAINING on READ DATA #####################
+######## For Cross-Validation if Require #####################
 
 k = 1 
 
@@ -188,15 +199,15 @@ y_pred_read = 0
 curr_read_model = None
 
 curr_read_mse = None
+################################################################
+
+################### INITIALIZING NEURAL NETWORK MODEL ###########
 
 final_read_X = read_configs[total_rows:total_rows+final_rows,:]
 final_read_y = read_bandwidth_values[total_rows:total_rows+final_rows]
 
 
 n_in, n_h1, n_h2, n_out, batch_size = total_cols, int(H1), int(H2), 1, train_rows
-#n_in, n_h1, n_h2, n_h3, n_h4, n_h5, n_out, batch_size = total_cols, 6, 5, 4, 3, 2, 1, train_rows
-#x = torch.randn(batch_size, n_in)
-#y = torch.tensor([[1.0], [0.0], [0.0], [1.0], [1.0], [1.0], [0.0], [0.0], [1.0], [1.0]])
 
 max_iterations = {
                 "MPI-IO_READ"      : 9570,
@@ -229,6 +240,8 @@ model = nn.Sequential(nn.Dropout(p=hyper_parameters[benchmark_name+"_"+operation
 print(model)
 for i in range (0,k):
 
+    ################# FOR CROSS-VALIDATION IF REQUIRE ###################    
+  
     start = i * test_rows
     X_train_read = torch.empty(train_rows,total_cols)
 
@@ -264,10 +277,7 @@ for i in range (0,k):
     for j in range(0,test_rows):
         y_pred_read[j][0] = read_bandwidth_values[j+start]
 
-    # if GPU is available, push the model to it
-    '''if torch.cuda.is_available():
-       device = torch.device("cuda")
-       net = net.to(device)'''
+    #################################################################
 
     ######################## TRAINING ON NN #####################
 
@@ -278,57 +288,38 @@ for i in range (0,k):
 
     y = y_train_read
     
-    '''x_np = x.numpy()
-    
-    y_np = y.numpy()
-    y_np = y_np.reshape(train_rows,)
-    model = RandomForestRegressor(n_estimators = 3000, random_state = 1, max_depth = 3500) 
-    model.fit(x_np, y_np);
-    '''
     device = 0
     # if GPU is available, push tensors to it
     if torch.cuda.is_available():
-       device = torch.device("cuda")
-       x = x.to(device)
-       y = y.to(device)
-       model = model.to(device)
-       #model_write = model_write.to(device)
-       X_train_read  = X_train_read.to(device)
-       y_train_read  = y_train_read.to(device)
-       #X_train_write = X_train_read.to(device)
-       #y_train_write = y_train_read.to(device)
-       X_pred_read   = X_pred_read.to(device)
-       y_pred_read   = y_pred_read.to(device)
-       #X_pred_write  = X_pred_write.to(device)
-       #y_pred_write  = y_pred_write.to(device)
-       final_read_X = final_read_X.to(device)
-       final_read_y = final_read_y.to(device)
+        print("CUDA AVAILABLE!!")
+        device = torch.device("cuda")
+        x = x.to(device)
+        y = y.to(device)
+        model = model.to(device)
+        #model_write = model_write.to(device)
+        X_train_read  = X_train_read.to(device)
+        y_train_read  = y_train_read.to(device)
+        #X_train_write = X_train_read.to(device)
+        #y_train_write = y_train_read.to(device)
+        X_pred_read   = X_pred_read.to(device)
+        y_pred_read   = y_pred_read.to(device)
+        #X_pred_write  = X_pred_write.to(device)
+        #y_pred_write  = y_pred_write.to(device)
+        final_read_X = final_read_X.to(device)
+        final_read_y = final_read_y.to(device)
+    else:
+        print("CUDA NOT AVAILABLE")
 
-    '''predictions = model.predict(final_read_X.numpy())
 
-    errors = abs(predictions - final_read_y.numpy())
-
-    mape = 100 * (errors / final_read_y.numpy())
-
-    accuracy = 100 - np.mean(mape)
-    print('Accuracy:', round(accuracy, 2), '%.')
-    '''
 
     criterion = torch.nn.MSELoss()
-
-    #criterion = torch.nn.CrossEntropyLoss() 
-
-    #optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.1)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=hyper_parameters[benchmark_name+"_"+operation][0], \
                                  weight_decay=hyper_parameters[benchmark_name+"_"+operation][1])
     print(optimizer)
-    #y_pred_train = torch.zeros(train_rows,1) 
-    #print(">>>>>>",y_pred_train.size()," ",y_train_read.size())
-    #model.train()
-    #input()
+    
     y_train_read = y_train_read.view(train_rows)
-    for epoch in range(max_iterations[benchmark_name+"_"+operation]):#itertools.count(start=1):
+    for epoch in range(max_iterations[benchmark_name+"_"+operation]):
 
         # Forward Propagation
         y_pred_train = model(x)
@@ -353,13 +344,8 @@ for i in range (0,k):
             mape = torch.div(errors, final_read_y) * 100.0
             accuracy = 100.0 - torch.mean(mape)
         print('epoch: ', epoch,' loss: ', loss.item(), ' loss_test: ', loss_test.item(), 'accuracy: ', accuracy.item())
-        #if accuracy.item() >= 80.0: #and accuracy.item() >= 96.5:# or loss.item() <= 1.20e-06:# or accuracy.item() >= 60.0:
-        #    break
+        
         model.train()
-
-    #for j in range(0,train_rows):
-    #    print(y_train_read[j][0].item(),y_pred_train[j].item(),sep=" ")
-    #print(y_pred_train.min())
 
     read_train_rmse_values[i] = torch.mean((y_pred_train-y_train_read)**2)
     print(read_train_rmse_values[i])
@@ -368,9 +354,7 @@ for i in range (0,k):
     torch.set_printoptions(threshold=10000)
     mse_train_read = torch.div(torch.sum(torch.abs(y_train_read - y_pred_train)),train_rows)
     print("mse on training set = ", mse_train_read)
-    #print("Accuracy for read on training set is ")
-    #for i in range(0,train_rows):
-    #    print(Accuracy_train_read[i].item())
+    
 
     print("Average accuracy for read on training set is ", torch.mean(torch.abs(Accuracy_train_read)))
 
@@ -386,15 +370,9 @@ for i in range (0,k):
         curr_read_mse = read_test_rmse_values[i]
         curr_read_model = model
 
-    #for i in range(0,test_rows):
-    #    print(y_pred_read[i][0].item(),y_pred_new[i].item(),sep=" ")
 
     Accuracy_pred_read = 100 - torch.div(torch.abs((y_pred_read - y_pred_new)), torch.max(y_pred_read,y_pred_new)) * 100
     torch.set_printoptions(threshold=10000)
-
-    #print("Accuracy for read on new set is ")
-    #for i in range(0,test_rows):
-    #    print(Accuracy_pred_read[i].item())
 
     print("Average accuracy for read on new set is ", torch.mean(torch.abs(Accuracy_pred_read)))
 
@@ -402,26 +380,12 @@ for i in range (0,k):
     print("relative residual for read on new set is ", relative_residual_pred_read)
     mse_test_read = torch.div(torch.sum(torch.abs(y_pred_read - y_pred_new)), test_rows)
     print("mse on test set", mse_test_read)
-    #quit()
-    #input()
+    
+################## COMPUTING PREDICTION RESULTS ################
 
 final_read_pred = torch.abs(curr_read_model(final_read_X))
 final_read_pred = final_read_pred.view(final_rows)
-'''x_read = torch.tensor([[1.0,2,1,32,1,4096,2048]])
 
-x_read[0][1] = x_read[0][1] / read_max_stripe_count
-x_read[0][2] = x_read[0][2] / read_max_stripe_size
-x_read[0][3] = x_read[0][3] / read_max_mpi_nodes
-x_read[0][4] = x_read[0][4] / read_max_processes
-x_read[0][5] = x_read[0][5] / read_max_traces
-x_read[0][6] = x_read[0][6] / read_max_samples
-
-#x_read[0,0] = 1.0
-#x_write[0,0] = 2.0
-
-print(x_read[0][0])
-output_read = torch.abs(curr_read_model(x_read)) * read_max_io_bandwidth
-print("read = ", output_read)'''
 
 print(final_read_pred.max() * read_max_io_bandwidth)
 print(final_read_pred.min() * read_max_io_bandwidth)
@@ -432,8 +396,13 @@ print(benchmark_name,' ',operation,' train avg rmse(s) ',read_train_rmse_values.
 print(benchmark_name,' ',operation,' test avg rmse(s) ',read_test_rmse_values.mean())
 print('\n')
 print(benchmark_name,' ',operation,' final rmse ', final_read_rmse)
+
+################# SAVING THE MODEL ################
     
-torch.save(curr_read_model, benchmark_name+"_"+operation+"_"+H1+"_"+H2+"_MODEL.pt")
+torch.save(curr_read_model, benchmark_name+"_"+operation+"_"+H1+"_"+H2+"_MODEL-new.pt")
+
+################ COMPUTING ACCURACY RESULTS ON PREDICTED IO BANDWIDTHS ########
+
 read_actual_sum = 0
 read_actual_avg = 0
 read_sum = 0
@@ -617,15 +586,12 @@ print("accuracy.item()=", accuracy.item(),"%.")
 print("training mse = ", loss.item())
 print("testing mse = ", loss_test.item())
 
-# Generating READ Predictions Graph
+# Generating Predictions Graph
+
 X_all_read = [i+1 for i in range(50)]
 y_all_final_read = (final_read_y[0:50] * read_max_io_bandwidth).tolist()
 y_all_pred_read = (final_read_pred[0:50] * read_max_io_bandwidth).tolist()
-#y_all_read = (torch.abs(curr_read_model(all_read_configs)) * read_max_io_bandwidth).tolist()
-#X = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-#y = [1529, 7763, 1413, 7100, 1129, 7929, 1540, 7298, 1330, 8264]
-#print(X_all_read)
-#print(y_all_read)
+
 plt.plot(X_all_read, y_all_final_read, \
            label="Actual values", \
            linestyle='solid', \
@@ -650,61 +616,4 @@ plt.legend()
 # function to show the plot 
 #plt.show()
 # save plot as figure .png image
-plt.savefig(benchmark_name+'_'+operation+"_"+H1+"_"+H2+'_PREDICTIONS.png')
-'''
-
-# Generating READ error loss graph
-X_k_read = [i+1 for i in range(k)]
-y_k_read = read_test_rmse_values.tolist()
-y_k_read_train = read_train_rmse_values.tolist()
-#X = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-#y = [1529, 7763, 1413, 7100, 1129, 7929, 1540, 7298, 1330, 8264]
-#print(X_all_write)
-#print(y_all_write)
-plt.plot(X_k_read, y_k_read, \
-           label="MPI-I/O READ Error Loss", \
-           linestyle='-', \
-           marker = 'x', \
-           markerfacecolor='red', \
-           markersize=5
-        )
-
-plt.xlabel('k-iterations')
-# naming the y axis 
-plt.ylabel('Mean Square Error')
-# giving a title to my graph 
-#plt.title('MPI-I/O Benchmarks') 
-# show a legend on the plot 
-plt.legend()
-# function to show the plot 
-plt.show()
-# save plot as figure .png image
-plt.savefig('MPIIO_READ_ERROR_LOSS.png')
-
-# Generating WRITE error loss graph
-X_k_write = [i+1 for i in range(k)]
-y_k_write = write_test_rmse_values.tolist()
-#y_k_write_train = write_train_rmse_values.tolist()
-#X = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-#y = [1529, 7763, 1413, 7100, 1129, 7929, 1540, 7298, 1330, 8264]
-#print(X_all_write)
-#print(y_all_write)
-plt.plot(X_k_write, y_k_write, \
-           label="MPI-I/O WRITE Error Loss", \
-           linestyle='-', \
-           marker = 'x', \
-           markerfacecolor='red', \
-           markersize=5
-        )
-
-plt.xlabel('k-iterations')
-# naming the y axis 
-plt.ylabel('Mean Square Error')
-# giving a title to my graph 
-#plt.title('MPI-I/O Benchmarks') 
-# show a legend on the plot 
-plt.legend()
-# function to show the plot 
-plt.show()
-# save plot as figure .png image
-plt.savefig('MPIIO_WRITE_ERROR_LOSS.png')'''
+plt.savefig(benchmark_name+'_'+operation+"_"+H1+"_"+H2+'_PREDICTIONS-new.png')
